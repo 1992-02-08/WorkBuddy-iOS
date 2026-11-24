@@ -1,0 +1,45 @@
+name: iOS IPA
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: 'Your permanent Bundle ID (confirm before installation)'
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      BUNDLE_ID: ${{ inputs.bundle_id }}
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.12'
+      - name: Test Go gateway and mobile lifecycle
+        run: go test ./...
+      - name: Race check mobile lifecycle
+        run: go test -race ./mobile
+      - name: Build unsigned device IPA
+        run: |
+          bash scripts/build-ios.sh 2>&1 | tee ios-build.log
+      - name: Upload IPA and symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: WorkBuddy-iOS-unsigned
+          path: |
+            build/ios/WorkBuddy-unsigned.ipa
+            build/ios/WorkBuddy.app.dSYM
+            build/ios/SHA256SUMS
+          if-no-files-found: error
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-diagnostics
+          path: ios-build.log
+          if-no-files-found: ignore

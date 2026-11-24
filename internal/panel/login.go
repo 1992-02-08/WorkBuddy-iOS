@@ -11,11 +11,13 @@ package panel
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -86,7 +88,11 @@ type apiEnvelope struct {
 
 // doJSON 发一次 JSON 请求并解信封。origin 为 Origin/Referer 基础域（随 realm 切）。
 func doJSON(method, fullURL, bearer string, body io.Reader, origin string) (json.RawMessage, int, error) {
-	req, err := http.NewRequest(method, fullURL, body)
+	return doJSONContext(context.Background(), loginHTTP, method, fullURL, bearer, body, origin)
+}
+
+func doJSONContext(ctx context.Context, client *http.Client, method, fullURL, bearer string, body io.Reader, origin string) (json.RawMessage, int, error) {
+	req, err := http.NewRequestWithContext(ctx, method, fullURL, body)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -94,12 +100,15 @@ func doJSON(method, fullURL, bearer string, body io.Reader, origin string) (json
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
-	resp, err := loginHTTP.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, 0, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, resp.StatusCode, fmt.Errorf("read body: %w", err)
+	}
 	if resp.StatusCode >= 300 {
 		return nil, resp.StatusCode, fmt.Errorf("http_error: upstream %d", resp.StatusCode)
 	}
@@ -111,6 +120,21 @@ func doJSON(method, fullURL, bearer string, body io.Reader, origin string) (json
 		return nil, resp.StatusCode, fmt.Errorf("code=%d msg=%s", env.Code, env.Msg)
 	}
 	return env.Data, resp.StatusCode, nil
+}
+
+func (p *Panel) loginLifetime() time.Duration {
+	if p.cfg.LoginTTL > 0 {
+		return p.cfg.LoginTTL
+	}
+	return loginTTL
+}
+
+func (p *Panel) loginJSON(r *http.Request, method, endpoint, bearer string, body io.Reader, origin string) (json.RawMessage, int, error) {
+	client := p.cfg.LoginHTTP
+	if client == nil {
+		client = loginHTTP
+	}
+	return doJSONContext(r.Context(), client, method, endpoint, bearer, body, origin)
 }
 
 // loginStart 发起设备授权：POST auth/state 拿授权 URL。
@@ -128,7 +152,7 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	epState, _, _, origin := loginEndpoints(realm)
-	data, status, err := doJSON(http.MethodPost, epState, "", bytes.NewReader([]byte("{}")), origin)
+	data, status, err := p.loginJSON(r, http.MethodPost, epState, "", bytes.NewReader([]byte("{}")), origin)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, fmt.Sprintf("auth state (upstream %d): %v", status, err))
 		return
@@ -144,7 +168,7 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 	p.loginMu.Lock()
 	// 顺手回收过期会话，防"开弹窗走开"的 state 滞留。
 	for s, sess := range p.logins {
-		if time.Since(sess.created) > loginTTL {
+		if time.Since(sess.created) >= p.loginLifetime() {
 			delete(p.logins, s)
 		}
 	}
@@ -163,6 +187,10 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	}
 	p.loginMu.Lock()
 	sess, known := p.logins[state]
+	if known && time.Since(sess.created) >= p.loginLifetime() {
+		delete(p.logins, state)
+		known = false
+	}
 	p.loginMu.Unlock()
 	if !known {
 		writeErr(w, http.StatusNotFound, "unknown or expired state（请重新发起添加账号）")
@@ -171,7 +199,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	_, epToken, epAcct, origin := loginEndpoints(sess.realm)
 
 	// auth/token 是权威登录状态端点：pending 时业务 code 非 0（"login ing"）。
-	tokRaw, _, err := doJSON(http.MethodGet, epToken+state, "", nil, origin)
+	tokRaw, _, err := p.loginJSON(r, http.MethodGet, epToken+url.QueryEscape(state), "", nil, origin)
 	if err != nil {
 		// pending / 未完成：面板前端继续轮询。
 		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": err.Error()})
@@ -194,7 +222,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		EnterpriseID string `json:"enterpriseId"`
 		Nickname     string `json:"nickname"`
 	}
-	if acctRaw, _, err := doJSON(http.MethodGet, epAcct+state, tok.AccessToken, nil, origin); err == nil {
+	if acctRaw, _, err := p.loginJSON(r, http.MethodGet, epAcct+url.QueryEscape(state), tok.AccessToken, nil, origin); err == nil {
 		_ = json.Unmarshal(acctRaw, &acct)
 	}
 	if acct.UID == "" {
@@ -208,6 +236,21 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, "上游返回的 uid 含非法字符，拒绝落盘（防路径穿越）")
 		return
 	}
+
+	// Recheck after upstream I/O and consume atomically: concurrent polls must not
+	// persist or trigger follow-up operations twice, nor complete an expired login.
+	p.loginMu.Lock()
+	current, exists := p.logins[state]
+	if !exists || current.created != sess.created || time.Since(current.created) >= p.loginLifetime() || r.Context().Err() != nil {
+		if exists && current.created == sess.created {
+			delete(p.logins, state)
+		}
+		p.loginMu.Unlock()
+		writeErr(w, http.StatusNotFound, "unknown or expired state（请重新发起添加账号）")
+		return
+	}
+	delete(p.logins, state)
+	p.loginMu.Unlock()
 
 	// 凭证落盘（嵌套形，与 auths/ 目录既有格式一致）→ 热加载进池。
 	if err := os.MkdirAll(p.cfg.AuthDir, 0o755); err != nil {
@@ -247,7 +290,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	checkinMsg := ""
 	remain := int64(-1)
 	total := int64(0)
-	if sess.realm == "global" {
+	if !p.cfg.GatewayOnly && sess.realm == "global" {
 		// 注册激活（幂等）：region required 时自动补地区（白名单首个，HK）后重新激活。
 		// 失败不阻断登录结果（auth 已落盘），只在返回字段里体现。
 		if activated, err := p.cfg.Upstream.GlobalCompleteRegistration(a); err != nil {
@@ -263,7 +306,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		} else if claimed {
 			log.Printf("panel: global trial uid=%s 已领", acct.UID)
 		}
-	} else if !a.IsEnterprise() {
+	} else if !p.cfg.GatewayOnly && !a.IsEnterprise() {
 		// 企业版跳过签到：上游 POST /v2/billing/meter/daily-checkin 对企业号
 		// 400 code 10001「企业账号不支持该操作」，发了只会把该错误写进登录返回。
 		// 下方 UserResource 余额查询照常（企业额度走 get-enterprise-user-usage 口径）。
@@ -276,9 +319,6 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		p.cfg.Pool.ReenableIfCredits(acct.UID, rm, tt)
 	}
 
-	p.loginMu.Lock()
-	delete(p.logins, state)
-	p.loginMu.Unlock()
 	log.Printf("panel: 新账号已热加载 uid=%s nickname=%q realm=%s（免重启生效）", acct.UID, acct.Nickname, sess.realm)
 	// 企业切换会话预警：该形态下 /v2/report 行为事件被上游静默丢弃（200 不计分），
 	// 成长任务全部无法点亮（签到/列表/额度/领养照常）。当场给出修复路径，

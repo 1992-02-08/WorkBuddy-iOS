@@ -34,6 +34,12 @@ import (
 
 // Config 面板依赖（main 装配注入）。
 type Config struct {
+	// GatewayOnly exposes only gateway management; no scheduler or reward actions.
+	GatewayOnly bool
+	// LoginHTTP optionally supplies the OAuth client (including lifecycle cancellation).
+	LoginHTTP *http.Client
+	// LoginTTL overrides the device-state lifetime; zero uses fifteen minutes.
+	LoginTTL time.Duration
 	Pool      *pool.Pool
 	Upstream  *upstream.Client
 	Scheduler *scheduler.Scheduler // 手动触发签到/保活；nil 时对应接口返回 501
@@ -151,6 +157,10 @@ func New(cfg Config) *Panel {
 func (p *Panel) Logs() *Ring { return p.logs }
 
 func (p *Panel) routes() {
+	if p.cfg.GatewayOnly {
+		p.gatewayRoutes()
+		return
+	}
 	p.mux.HandleFunc("GET /panel/{$}", p.index)
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
 	p.mux.HandleFunc("GET /panel/mobile.css", p.mobileStyle)
@@ -196,6 +206,39 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/compensation", p.withAuth(p.compensation))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/compensation", p.withAuth(p.accountCompensationClaim))
 	p.mux.HandleFunc("POST /panel/api/compensation_all", p.withAuth(p.compensationAll))
+}
+
+// gatewayRoutes is an explicit allowlist: new task endpoints never become mobile APIs.
+func (p *Panel) gatewayRoutes() {
+	// Public assets contain no credentials; the WebView supplies Bearer only for APIs.
+	p.mux.HandleFunc("GET /panel/{$}", p.index)
+	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
+	p.mux.HandleFunc("GET /panel/mobile.css", p.mobileStyle)
+	p.mux.HandleFunc("GET /panel/mobile.js", p.mobileScript)
+	for pattern, handler := range map[string]http.HandlerFunc{
+		"GET /panel/api/overview": p.overview,
+		"GET /panel/api/logs": p.logsHandler,
+		"GET /panel/api/request_metrics": p.requestMetrics,
+		"GET /panel/api/request_logs": p.requestLogs,
+		"GET /panel/api/credit_history": p.creditHistory,
+		"GET /panel/api/models": p.models,
+		"POST /panel/api/login/start": p.loginStart,
+		"GET /panel/api/login/poll": p.loginPoll,
+		"GET /panel/api/login/regions": p.loginRegions,
+		"POST /panel/api/accounts/{uid}/revive": p.accountRevive,
+		"POST /panel/api/accounts/{uid}/disable": p.accountDisable,
+		"POST /panel/api/accounts/{uid}/pause": p.accountPause,
+		"POST /panel/api/accounts/{uid}/resume": p.accountResume,
+		"POST /panel/api/accounts/{uid}/balance": p.accountBalance,
+		"POST /panel/api/accounts/{uid}/remove": p.accountRemove,
+		"GET /panel/api/packages": p.packages,
+		"GET /panel/api/usage": p.usage,
+		"POST /panel/api/usage/save": p.usageSave,
+		"GET /panel/api/config": p.getConfig,
+		"POST /panel/api/config": p.saveConfig,
+	} {
+		p.mux.HandleFunc(pattern, p.withAuth(handler))
+	}
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API

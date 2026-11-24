@@ -1,3 +1,31 @@
+# WorkBuddy iOS 独立本机网关
+
+此分支把原 Go 网关编译为静态框架，嵌入 iOS 16+ UIKit 应用；原 Web 管理面板随核心内嵌，没有 LoopAI 集成、子进程或远端网页壳。原生界面采用首页、账号、设置三页底部导航：首页提供网关状态卡片、启动/停止、地址和密钥分别复制、账号概况及高级面板入口；账号页提供本人 OAuth、额度刷新、暂停/恢复及确认移除；设置页提供常用表单、完整 JSON 编辑和开源许可。未启动、空账号、等待授权和错误均有对应提示。监听仅限 `127.0.0.1`，OpenAI 入口为 `http://127.0.0.1:<端口>/v1`。
+
+配置、随机非空 API 密钥及本人授权凭证保存在运行时解析的 `Application Support/WorkBuddy`，排除备份；WebView 使用临时存储。密钥只注入当前端口的本机面板，外部授权页通过系统 Safari 浏览器视图打开。沿用设备授权 state + 轮询，不虚构 URL 回调。授权入口限制 HTTPS 官方域名，上游改域后需审查更新。
+
+**仅前台运行**：进入后台停止服务、取消在途请求并保存；返回后手动启动。Safari 浏览器视图保持应用前台；若跳至其他应用导致后台停止，需重新启动授权。其他本机客户端在此生命周期限制下的调用体验尚待实测，不承诺后台常驻。iOS 网关模式禁用签到、奖励、任务、补偿及批量凭证导入，原桌面入口保留。部分原面板配置选项在移动端不支持。
+
+## 构建 IPA
+
+目前**尚未生成 IPA，也未安装或实测上游接口**。原仓库已于 2026-10-21 停止维护，上游收紧非官方访问；代码移植不能保证 OAuth 或模型请求可用。
+
+在安装完整 Xcode 的 macOS 上使用 Go 1.23.12：
+
+```bash
+go test ./...
+go test -race ./mobile
+BUNDLE_ID=你的永久标识 bash scripts/build-ios.sh
+```
+
+输出 `build/ios/WorkBuddy-unsigned.ipa`、SHA256SUMS 和 dSYM；gomobile 固定版本，原模块文件不变。**未签名 IPA 不能直接安装**，需另行签名/配置描述文件或兼容安装方式，首次安装前确认 Bundle ID。本任务不安装应用。
+
+也可在自己的 GitHub 仓库手动运行 `iOS IPA` 工作流，输入 Bundle ID，从 Artifacts 下载产物；不创建 Release。继续远程构建需要你指定新仓库名及 public/private，并授权推送。当前没有创建仓库或推送；不能推到原作者仓库。Docker 工作流改为手动触发，避免未来推送时自动发布容器。
+
+已通过 shell 构建脚本语法检查，以及使用临时桥接声明、关闭 Clang modules 后的 ObjC 严格语法检查（`-Werror`）。后者不代表真实 Go 框架链接成功。本机缺 Go/Xcode；Go 测试、框架链接、IPA 构建、OAuth、SSE、配置和界面均待完整构建及实机验证，详细流程见 AGENTS.md。MIT LICENSE 保留。以下为上游原始说明，其中任务功能不在 iOS 入口开放。
+
+---
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/DGZSbot/ai-icon/refs/heads/main/WorkBuddy.png" alt="WorkBuddy2API" width="120">
 </p>

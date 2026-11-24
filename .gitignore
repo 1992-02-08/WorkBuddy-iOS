@@ -35,6 +35,14 @@ docs/
 *.md
 !README.md
 
+# iOS gateway source and local output
+!AGENTS.md
+!ios/*.md
+/build/
+*.ipa
+*.xcframework/
+*.dSYM/
+
 # Windows binaries
 /wb2api.exe
 /login.exe
